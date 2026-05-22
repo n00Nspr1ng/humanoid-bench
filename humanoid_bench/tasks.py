@@ -69,6 +69,4 @@ class Task:
         return obs, reward, terminated, False, info
 
     def render(self):
-        return self._env.mujoco_renderer.render(
-            self._env.render_mode, self._env.camera_id, self._env.camera_name
-        )
+        return self._env.mujoco_renderer.render(self._env.render_mode)

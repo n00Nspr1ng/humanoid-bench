@@ -1,240 +1,132 @@
-# HumanoidBench: Simulated Humanoid Benchmark for Whole-Body Locomotion and Manipulation
+# HumanoidBench — Lowlevel Policy Training for H1
 
-[Paper](https://arxiv.org/abs/2403.10506) [Website](https://sferrazza.cc/humanoidbench_site/)
+This fork of HumanoidBench is used to train and evaluate a **lowlevel locomotion policy for the Unitree H1** robot, which serves as the motor primitive for a hierarchical LLM-based control system in `humanoid_coordination`.
 
-We present [HumanoidBench](https://sferrazza.cc/humanoidbench_site/), a simulated humanoid robot benchmark consisting of $15$ whole-body manipulation and $12$ locomotion tasks. This repo contains the code for environments and training.
+The original HumanoidBench README is preserved at `README_ORIGINAL.md`.
 
-![image](humanoid_bench.jpg)
+---
 
-## Directories
-Structure of the repository:
-* `data`: Weights of the low-level skill policies
-* `dreamerv3`: Training code for dreamerv3
-* `humanoid_bench`: Core benchmark code
-    * `assets`: Simulation assets
-    * `envs`: Environment files
-    * `mjx`: MuJoCo MJX training code
-* `jaxrl_m`: Training code for SAC
-* `ppo`: Training code for PPO
-* `tdmpc2`: Training code for TD-MPC2
+## Why HumanoidBench
+
+The main `humanoid_coordination` codebase trains lowlevel policies in **Isaac Lab (PhysX, G1 robot)**. Moving to HumanoidBench for the H1 lowlevel policy avoids the sim-to-sim transfer problem: the policy is trained and evaluated in the same MuJoCo physics backend. HumanoidBench also provides GPU-parallel training via Brax/MJX for the lowlevel, and a library of CPU MuJoCo task environments for highlevel evaluation.
+
+---
+
+## Overall Pipeline
+
+```
+[1] Train lowlevel policy
+    Brax/MJX (GPU-parallel)
+    h1_mjx_feet_collisions_pos.xml
+    humanoid_bench/mjx/envs/lowlevel.py
+            |
+            | JAX/Flax checkpoint
+            v
+[2] Convert to PyTorch
+    humanoid_bench/mjx/flax_to_torch.py
+    -> TorchModel (256-256 MLP) + TorchPolicy
+    -> checkpoints/policy.pt
+            |
+            | TorchPolicy loaded at runtime
+            v
+[3] Highlevel task evaluation
+    CPU MuJoCo gymnasium env (h1_pos_*.xml, h1hand_pos_*.xml, ...)
+    Wrapper holds TorchPolicy, builds lowlevel obs from live sim state,
+    calls policy every step, passes 19 joint targets to task env
+    (same pattern as SingleReachWrapper in wrappers.py)
+            |
+            v
+[4] LLM-generated highlevel policy
+    humanoid_coordination/llm/ (lives outside this repo)
+    generates Python policy code that issues commands to the wrapper
+```
+
+---
+
+## Robot Variants and XML Files
+
+### `assets/robots/` — pure robot definitions (used by CPU gymnasium env)
+
+| File | DOF | Description |
+|---|---|---|
+| `h1_pos.xml` | 19 | Base H1, no hands |
+| `h1hand_pos.xml` | 76 | H1 + Shadow Hand dexterous fingers |
+| `h1simplehand_pos.xml` | 52 | H1 + simplified hands |
+| `h1touch_pos.xml` | 76 | H1 + touch sensors + Shadow Hand |
+| `h1strong_pos.xml` | 76 | H1 + stronger actuators |
+| `h1gripper_pos.xml` | — | H1 + gripper |
+
+### `assets/mjx/` — MJX-specific scenes (used by Brax training)
+
+| File | Collision geometry | Used for |
+|---|---|---|
+| `h1_mjx_feet_collisions_pos.xml` | Feet only (2 boxes) | Lowlevel training — fast, contacts only where needed |
+| `h1_mesh_collisions_hands_pos.xml` | Full body meshes + hands | Testing with full collision fidelity |
+
+`h1_mjx_feet_collisions_pos.xml` is the right choice for lowlevel locomotion training. Feet contacts are all that matter for walking, and simplified geometry keeps MJX simulation fast.
+
+### `assets/envs/` — task scene XMLs (used by CPU task envs)
+
+Named `{robot}_{control}_{task}.xml`, e.g. `h1_pos_walk.xml`, `h1hand_pos_push.xml`. Each includes the robot + task-specific objects (obstacles, boxes, stairs, etc.). These are loaded by `HumanoidEnv` at task evaluation time.
+
+### How training XML relates to task XMLs
+
+The lowlevel policy is trained on the simplified MJX scene. At task evaluation time, the wrapper loads whatever task env XML is needed and runs the TorchPolicy directly on the live sim state (`qpos`, `qvel`, hand positions) — the policy never sees the task XML. If the task env has hands (`nu > 19`), the wrapper fills body joints from the policy and handles hand joints separately.
+
+---
+
+## Control Mode
+
+All H1 XML files use **position control** (`<position>` actuators) with PD gains:
+
+| Joint group | kp | kv | Force limit |
+|---|---|---|---|
+| Hip | 200 | 5 | ±200 N |
+| Knee | 300 | 6 | ±300 N |
+| Ankle | 40 | 2 | ±40 N |
+| Torso | 300 | 6 | ±200 N |
+| Shoulder (pitch/roll) | 100 | 2 | ±40 N |
+| Shoulder (yaw) / Elbow | 100 | 2 | ±18 N |
+
+Action space for the lowlevel policy: **19 joint position targets** (body only, no hands).
+
+---
+
+## New Files in This Fork
+
+```
+humanoid_bench/mjx/envs/
+└── lowlevel.py          # H1 locomotion env for Brax/MJX training
+
+checkpoints/
+├── flax/                # Raw JAX/Flax checkpoint from training
+└── policy.pt            # Converted TorchPolicy (PyTorch)
+```
+
+The training entry point is the existing `humanoid_bench/mjx/ppo_continuous_action.py` with `h1_lowlevel` registered as a new Brax env. No separate training script is needed.
+
+---
 
 ## Installation
-Create a clean conda environment:
-```
-conda create -n humanoidbench python=3.11
-conda activate humanoidbench
-```
-Then, install the required packages:
-```
-# Install HumanoidBench
+
+```bash
+# 1. Install HumanoidBench env
 pip install -e .
-
-# jax GPU version
-pip install "jax[cuda12]==0.4.28"
-# Or, jax CPU version
-pip install "jax[cpu]==0.4.28"
-
-# Install jaxrl
-pip install -r requirements_jaxrl.txt
-
-# Install dreamer
-pip install -r requirements_dreamer.txt
-
-# Install td-mpc2
-pip install -r requirements_tdmpc.txt
-
-# Install stable-baselines3 (PPO)
-pip install stable-baselines3==2.3.2
+# 2. Install more requirements
+pip install -r requirements_lowlevel.txt
 ```
 
+`requirements_lowlevel.txt` covers the Brax/JAX training stack (brax, flax, optax, distrax, chex, gymnax, absl-py). JAX must be installed before the rest to avoid the CPU-only `jax` wheel overwriting the CUDA version.
 
-## Environments
+`gymnasium`, `torch`, and `tensorboard` are expected to already be installed in your environment and are intentionally excluded from both `setup.py` and `requirements_lowlevel.txt`.
 
-### Main Benchmark Tasks
-* `h1hand-walk-v0`
-* `h1hand-reach-v0`
-* `h1hand-hurdle-v0`
-* `h1hand-crawl-v0`
-* `h1hand-maze-v0`
-* `h1hand-push-v0`
-* `h1hand-cabinet-v0`
-* `h1strong-highbar_hard-v0`  # Make hands stronger to be able to hang from the high bar
-* `h1hand-door-v0`
-* `h1hand-truck-v0`
-* `h1hand-cube-v0`
-* `h1hand-bookshelf_simple-v0`
-* `h1hand-bookshelf_hard-v0`
-* `h1hand-basketball-v0`
-* `h1hand-window-v0`
-* `h1hand-spoon-v0`
-* `h1hand-kitchen-v0`
-* `h1hand-package-v0`
-* `h1hand-powerlift-v0`
-* `h1hand-room-v0`
-* `h1hand-stand-v0`
-* `h1hand-run-v0`
-* `h1hand-sit_simple-v0`
-* `h1hand-sit_hard-v0`
-* `h1hand-balance_simple-v0`
-* `h1hand-balance_hard-v0`
-* `h1hand-stair-v0`
-* `h1hand-slide-v0`
-* `h1hand-pole-v0`
-* `h1hand-insert_normal-v0`
-* `h1hand-insert_small-v0`
+---
 
-### Test Environments with Random Actions
-```
-python -m humanoid_bench.test_env --env h1hand-walk-v0
-```
+## Relationship to `humanoid_coordination`
 
-### Test Environments with Hierarchical Policy and Random Actions
-```
-# Define checkpoints to pre-trained low-level policy and obs normalization
-export POLICY_PATH="data/reach_two_hands/torch_model.pt"
-export MEAN_PATH="data/reach_two_hands/mean.npy"
-export VAR_PATH="data/reach_two_hands/var.npy"
+The `humanoid_coordination` package (parent repo) contains:
+- The LLM code generation system (`llm/`) — simulator-agnostic, stays there
+- The G1/Isaac Lab lowlevel policy and training pipeline — kept as-is
+- Highlevel task wrappers that will call into this repo's TorchPolicy at evaluation time
 
-# Test the environment
-python -m humanoid_bench.test_env --env h1hand-push-v0 --policy_path ${POLICY_PATH} --mean_path ${MEAN_PATH} --var_path ${VAR_PATH} --policy_type "reach_double_relative"
-```
-
-### Test Low-Level Reaching Policy (trained with MJX, testing on classical MuJoCo)
-```
-# One-hand reaching
-python -m humanoid_bench.mjx.mjx_test --with_full_model 
-
-# Two-hand reaching
-python -m humanoid_bench.mjx.mjx_test --with_full_model --task=reach_two_hands --folder=./data/reach_two_hands
-```
-
-### Change Observations
-As a default, the environment returns a privileged state of the environment (e.g., robot state + environment state). To get proprio, visual, and tactile sensing, set `obs_wrapper=True` and accordingly select the required sensors, e.g. `sensors="proprio,image,tactile"`. When using tactile sensing, make sure to use `h1touch` in place of `h1hand`.
-Full test instruction:
-```
-python -m humanoid_bench.test_env --env h1touch-stand-v0 --obs_wrapper True --sensors "proprio,image,tactile"
-```
-
-### Other Environments
-In addition to the main benchmark tasks listed above, you can run the following environements that feature the robot without hands:
-* `h1-walk-v0`
-* `h1-reach-v0`
-* `h1-hurdle-v0`
-* `h1-crawl-v0`
-* `h1-maze-v0`
-* `h1-push-v0`
-* `h1-highbar_simple-v0`
-* `h1-door-v0`
-* `h1-truck-v0`
-* `h1-basketball-v0`
-* `h1-package-v0`
-* `h1-stand-v0`
-* `h1-run-v0`
-* `h1-sit_simple-v0`
-* `h1-sit_hard-v0`
-* `h1-balance_simple-v0`
-* `h1-balance_hard-v0`
-* `h1-stair-v0`
-* `h1-slide-v0`
-* `h1-pole-v0`
-
-The robot with low-dimensional hands:
-* `h1simplehand-pole-v0`
-
-And the Unitree G1 robot with three-finger hands:
-* `g1-walk-v0`
-* `g1-reach-v0`
-* `g1-hurdle-v0`
-* `g1-crawl-v0`
-* `g1-maze-v0`
-* `g1-push-v0`
-* `g1-cabinet-v0`
-* `g1-door-v0`
-* `g1-truck-v0`
-* `g1-cube-v0`
-* `g1-bookshelf_simple-v0`
-* `g1-bookshelf_hard-v0`
-* `g1-basketball-v0`
-* `g1-window-v0`
-* `g1-spoon-v0`
-* `g1-kitchen-v0`
-* `g1-package-v0`
-* `g1-powerlift-v0`
-* `g1-room-v0`
-* `g1-stand-v0`
-* `g1-run-v0`
-* `g1-sit_simple-v0`
-* `g1-sit_hard-v0`
-* `g1-balance_simple-v0`
-* `g1-balance_hard-v0`
-* `g1-stair-v0`
-* `g1-slide-v0`
-* `g1-pole-v0`
-* `g1-insert_normal-v0`
-* `g1-insert_small-v0`
-
-## Training
-```
-# Define TASK
-export TASK="h1hand-sit_simple-v0"
-
-# Train TD-MPC2
-python -m tdmpc2.train disable_wandb=False wandb_entity=[WANDB_ENTITY] exp_name=tdmpc task=humanoid_${TASK} seed=0
-
-# Train DreamerV3
-python -m embodied.agents.dreamerv3.train --configs humanoid_benchmark --run.wandb True --run.wandb_entity [WANDB_ENTITY] --method dreamer --logdir logs --task humanoid_${TASK} --seed 0
-
-# Train SAC
-python ./jaxrl_m/examples/mujoco/run_mujoco_sac.py --env_name ${TASK} --wandb_entity [WANDB_ENTITY] --seed 0
-
-# Train PPO (not using MJX)
-python ./ppo/run_sb3_ppo.py --env_name ${TASK} --wandb_entity [WANDB_ENTITY] --seed 0
-```
-
-
-## Training Hierarchical Policies
-```
-# Define TASK
-export TASK="h1hand-push-v0"
-
-# Define checkpoints to pre-trained low-level policy and obs normalization
-export POLICY_PATH="data/reach_one_hand/torch_model.pt"
-export MEAN_PATH="data/reach_one_hand/mean.npy"
-export VAR_PATH="data/reach_one_hand/var.npy"
-
-# Train TD-MPC2 with pre-trained low-level policy
-python -m tdmpc2.train disable_wandb=False wandb_entity=[WANDB_ENTITY] exp_name=tdmpc task=humanoid_${TASK} seed=0 policy_path=${POLICY_PATH} mean_path=${MEAN_PATH} var_path=${VAR_PATH} policy_type="reach_single"
-
-# Train DreamerV3 with pre-trained low-level policy
-python -m embodied.agents.dreamerv3.train --configs humanoid_benchmark --run.wandb True --run.wandb_entity [WANDB_ENTITY] --method dreamer_${TASK}_hierarchical --logdir logs --env.humanoid.policy_path ${POLICY_PATH} --env.humanoid.mean_path ${MEAN_PATH} --env.humanoid.var_path ${VAR_PATH} --env.humanoid.policy_type="reach_single" --task humanoid_${TASK} --seed 0
-```
-
-## Paper Training Curves
-
-Please find [here](https://github.com/carlosferrazza/humanoid-bench/tree/main/logs) json files including all the training curves, so that comparing with our baselines will not necessarily require re-running them in the future.
-
-The json files follow this key structure: task -> method -> seed_X -> (million_steps or return). As an example to access the return sequence for one seed of the SAC run for the walk task, you can query the json data as `data['walk']['SAC']['seed_0']['return']`.
-
-
-## Citation
-If you find HumanoidBench useful for your research, please cite this work:
-```
-@article{sferrazza2024humanoidbench,
-    title={HumanoidBench: Simulated Humanoid Benchmark for Whole-Body Locomotion and Manipulation},
-    author={Carmelo Sferrazza and Dun-Ming Huang and Xingyu Lin and Youngwoon Lee and Pieter Abbeel},
-    journal={arXiv Preprint arxiv:2403.10506},
-    year={2024}
-}
-```
-
-
-## References
-This codebase contains some files adapted from other sources:
-* jaxrl_m: https://github.com/dibyaghosh/jaxrl_m/tree/main
-* DreamerV3: https://github.com/danijar/dreamerv3
-* TD-MPC2: https://github.com/nicklashansen/tdmpc2
-* purejaxrl (JAX-PPO traning): https://github.com/luchris429/purejaxrl/tree/main
-* Digit models: https://github.com/adubredu/KinodynamicFabrics.jl/tree/sim
-* Unitree H1 models: https://github.com/unitreerobotics/unitree_ros/tree/master
-* MuJoCo Menagerie (Unitree H1, Shadow Hands, Robotiq 2F-85 models): https://github.com/google-deepmind/mujoco_menagerie
-* Robosuite (some texture files): https://github.com/ARISE-Initiative/robosuite
+This repo is responsible only for H1 lowlevel training and the task environments the highlevel policy is evaluated on.

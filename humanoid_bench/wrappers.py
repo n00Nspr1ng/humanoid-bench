@@ -578,12 +578,16 @@ class ObservationWrapper(BaseWrapper):
         return obs, rew, terminated, truncated, info
 
     def get_camera_obs(self):
-        left_eye = self.task._env.mujoco_renderer.render(
-            "rgb_array", camera_name="left_eye_camera"
-        )
-        right_eye = self.task._env.mujoco_renderer.render(
-            "rgb_array", camera_name="right_eye_camera"
-        )
+        renderer = self.task._env.mujoco_renderer
+        model = self.task._env.model
+        orig_camera_id = renderer.camera_id
+
+        renderer.camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "left_eye_camera")
+        left_eye = renderer.render("rgb_array")
+        renderer.camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "right_eye_camera")
+        right_eye = renderer.render("rgb_array")
+        renderer.camera_id = orig_camera_id
+
         return {"image_left_eye": left_eye, "image_right_eye": right_eye}
 
     def normalize_action(self, action):

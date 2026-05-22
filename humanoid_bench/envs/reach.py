@@ -100,9 +100,7 @@ class Reach(Task):
                 label="",
             )
 
-        return self._env.mujoco_renderer.render(
-            self._env.render_mode, self._env.camera_id, self._env.camera_name
-        )
+        return self._env.mujoco_renderer.render(self._env.render_mode)
 
 
 if __name__ == "__main__":

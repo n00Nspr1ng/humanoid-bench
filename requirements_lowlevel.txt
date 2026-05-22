@@ -1,0 +1,25 @@
+# JAX ecosystem for GPU-parallel lowlevel policy training
+#
+# numpy must stay <2 for isaaclab/torch compatibility.
+#
+#   pip install -r requirements_lowlevel.txt
+
+# numpy must stay on 1.x — jax 0.4.x accepts 1.x but pip may try to upgrade
+numpy==1.26.0
+
+# cudnn must stay pinned — jax-cuda12-plugin pulls newer cudnn which breaks torch
+nvidia-cudnn-cu12==9.7.1.26
+
+jax[cuda12]==0.4.30
+jaxlib==0.4.30
+
+# mujoco pinned to match dmc_sizes.py (generated for header 316 = 3.1.6)
+mujoco==3.1.6
+mujoco-mjx==3.1.6
+
+brax==0.9.4
+flax==0.8.5
+optax==0.2.4
+distrax==0.1.5
+chex==0.1.87
+absl-py==2.4.0
