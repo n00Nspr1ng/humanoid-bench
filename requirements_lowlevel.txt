@@ -23,3 +23,5 @@ optax==0.2.4
 distrax==0.1.5
 chex==0.1.87
 absl-py==2.4.0
+gymnax==0.0.9
+wandb

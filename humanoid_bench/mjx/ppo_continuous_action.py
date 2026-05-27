@@ -18,11 +18,13 @@ from wrappers import (
 from brax import envs
 from humanoid_bench.mjx.envs.reach_continual import HumanoidReachContinual
 from humanoid_bench.mjx.envs.reach_continual_two_hands import HumanoidReachContinualTwoHands
+from humanoid_bench.mjx.envs.lowlevel_loco import H1LowLevelLoco
+from humanoid_bench.mjx.envs.lowlevel_stand import H1LowLevelStand
 
 from flax_to_torch import flax_to_torch, TorchModel, TorchPolicy
 
 import os
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 from absl import app, flags
 
@@ -30,45 +32,39 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_string('job_name', None, 'Name of the job to be launched', required=True)
 flags.DEFINE_integer('seed', 0, 'Random seed.')
+flags.DEFINE_string('env_name', 'h1_lowlevel', 'Environment name to train.')
+flags.DEFINE_integer('num_envs', 2048, 'Number of parallel environments.')
 
 envs.register_environment('h1_reach_continual', HumanoidReachContinual)
 envs.register_environment('h1_reach_continual_two_hands', HumanoidReachContinualTwoHands)
+envs.register_environment('h1_lowlevel_loco', H1LowLevelLoco)
+envs.register_environment('h1_lowlevel_stand', H1LowLevelStand)
 
 class ActorCritic(nn.Module):
-    action_dim: Sequence[int]
+    action_dim: int
+    actor_obs_dim: int   # first N dims of obs go to the actor; full obs goes to the critic
     activation: str = "tanh"
 
     @nn.compact
     def __call__(self, x):
-        if self.activation == "relu":
-            activation = nn.relu
-        else:
-            activation = nn.tanh
-        actor_mean = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
+        activation = nn.tanh if self.activation != "relu" else nn.relu
+
+        # Actor head — sees only the actor obs slice
+        actor_obs = x[..., :self.actor_obs_dim]
+        actor_mean = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(actor_obs)
         actor_mean = activation(actor_mean)
-        actor_mean = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(actor_mean)
+        actor_mean = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(actor_mean)
         actor_mean = activation(actor_mean)
-        actor_mean = nn.Dense(
-            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
-        )(actor_mean)
+        actor_mean = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(actor_mean)
         actor_logtstd = self.param("log_std", nn.initializers.zeros, (self.action_dim,))
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
 
-        critic = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
+        # Critic head — sees full obs (privileged)
+        critic = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         critic = activation(critic)
-        critic = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(critic)
+        critic = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(critic)
         critic = activation(critic)
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
-        )
+        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(critic)
 
         return pi, jnp.squeeze(critic, axis=-1)
 
@@ -81,7 +77,7 @@ class Transition(NamedTuple):
     obs: jnp.ndarray
     info: jnp.ndarray
 
-def make_train(config, writer):
+def make_train(config):
     config["NUM_UPDATES"] = (
             config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -104,37 +100,14 @@ def make_train(config, writer):
         )
         return config["LR"] * frac
 
-    def train(rng):
-        # INIT NETWORK
-        network = ActorCritic(
-            action_dim=config['DIMU'], activation=config["ACTIVATION"]
-        )
-        rng, _rng = jax.random.split(rng)
-        init_x = jnp.zeros(config['DIMO'])
-        network_params = network.init(_rng, init_x)
-        if config["ANNEAL_LR"]:
-            tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(learning_rate=linear_schedule, eps=1e-5),
-            )
-        else:
-            tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(config["LR"], eps=1e-5),
-            )
-        train_state = TrainState.create(
-            apply_fn=network.apply,
-            params=network_params,
-            tx=tx,
-        )
+    # Build network once at make_train time so _update_step can close over it
+    network = ActorCritic(
+        action_dim=config['DIMU'],
+        actor_obs_dim=config['DIMO_ACTOR'],
+        activation=config["ACTIVATION"],
+    )
 
-        # INIT ENV
-        rng, _rng = jax.random.split(rng)
-        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = env.reset(reset_rng, env_params)
-
-        # TRAIN LOOP
-        def _update_step(runner_state, unused):
+    def _update_step(runner_state, unused):
             
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
@@ -285,45 +258,44 @@ def make_train(config, writer):
             rng = update_state[-1]
             if config.get("DEBUG"):
                 def callback(info, env_state, train_state):
-                    # Get the done timesteps
                     return_values = info["returned_episode_returns"][info["returned_episode"]]
                     length_values = info["returned_episode_lengths"][info["returned_episode"]]
-                    timesteps = (info["timestep"][info["returned_episode"]] * config["NUM_ENVS"])
-                    for t in range(min(len(timesteps), 5)):  # print first 5
+                    timesteps = info["timestep"][info["returned_episode"]] * config["NUM_ENVS"]
+                    for t in range(min(len(timesteps), 5)):
                         print(
-                            f"global step={timesteps[t]}, episodic return={return_values[t]}, episodic length={length_values[t]}")
-                        
-                    state_info = env_state.env_state.env_state.env_state.info
-                    
-                    target_dist_left = state_info['target_dist_left']
-                    target_dist_right = state_info['target_dist_right']
-                    
-                    total_successes = state_info['total_successes'][info["returned_episode"][-1, :]]
-                    
+                            f"global step={timesteps[t]}, episodic return={return_values[t]}, "
+                            f"episodic length={length_values[t]}")
+
                     if len(timesteps) > 0:
-                        writer.add_scalar("train/episode_return", return_values.mean(), timesteps[-1])
-                        writer.add_scalar("train/episode_length", length_values.mean(), timesteps[-1])
-                        num_samples = 500
-                    
-                        # Log the histogram of target distance
-                        writer.add_histogram("train/target_dist_left", target_dist_left[:num_samples], timesteps[-1])
-                        writer.add_histogram("train/target_dist_right", target_dist_right[:num_samples], timesteps[-1])
+                        step = int(timesteps[-1])
+                        wandb.log({
+                            "train/episode_return": float(return_values.mean()),
+                            "train/episode_length": float(length_values.mean()),
+                        }, step=step)
 
-                        if len(total_successes) > 0: 
-                            writer.add_histogram("train/total_successes", total_successes, timesteps[-1])
+                        # Reach-task-specific metrics
+                        if config["ENV_NAME"].startswith("h1_reach"):
+                            state_info = env_state.env_state.env_state.env_state.info
+                            num_samples = 500
+                            wandb.log({
+                                "train/target_dist_left":  wandb.Histogram(np.array(state_info['target_dist_left'][:num_samples])),
+                                "train/target_dist_right": wandb.Histogram(np.array(state_info['target_dist_right'][:num_samples])),
+                            }, step=step)
+                            total_successes = state_info['total_successes'][info["returned_episode"][-1, :]]
+                            if len(total_successes) > 0:
+                                wandb.log({"train/total_successes": wandb.Histogram(np.array(total_successes))}, step=step)
 
-                        if timesteps[-1] // (config["NUM_STEPS"] * config["NUM_ENVS"]) % 100 == 0:
+                        if step // (config["NUM_STEPS"] * config["NUM_ENVS"]) % 100 == 0:
                             print("Saving model")
                             save_folder = config["SAVE_FOLDER"]
-                            torch_model = TorchModel(config['DIMO'], config['DIMU'])
+                            torch_model = TorchModel(config['DIMO_ACTOR'], config['DIMU'])
                             torch_model = flax_to_torch(train_state, torch_model)
                             torch_policy = TorchPolicy(torch_model)
-                            torch_policy.save(os.path.join(save_folder, "torch_model_{}.pt".format(timesteps[-1])))
-                            # Save mean and var
+                            torch_policy.save(os.path.join(save_folder, "torch_model_{}.pt".format(step)))
                             mean = env_state.env_state.mean
                             var = env_state.env_state.var
-                            np.save(os.path.join(save_folder, "mean_{}.npy".format(timesteps[-1])), mean)
-                            np.save(os.path.join(save_folder, "var_{}.npy".format(timesteps[-1])), var)
+                            np.save(os.path.join(save_folder, "mean_{}.npy".format(step)), mean)
+                            np.save(os.path.join(save_folder, "var_{}.npy".format(step)), var)
 
 
                 jax.debug.callback(callback, metric, env_state, train_state)
@@ -331,20 +303,38 @@ def make_train(config, writer):
             runner_state = (train_state, env_state, last_obs, rng)
             return runner_state, metric
 
+    def init(rng):
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, env_state, obsv, _rng)
-
-        # Split scanning: not clean, but effective way to prevent JAX memory allocation issues
-        split_scan_n = config["TOTAL_TIMESTEPS"] // 5e8 + 1
-        metric = None
-        for _ in range(int(split_scan_n)):
-            runner_state, metric = jax.lax.scan(
-                _update_step, runner_state, None, config["NUM_UPDATES"]//split_scan_n
+        init_x = jnp.zeros(config['DIMO'])
+        network_params = network.init(_rng, init_x)
+        if config["ANNEAL_LR"]:
+            tx = optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.adam(learning_rate=linear_schedule, eps=1e-5),
             )
-     
-        return {"runner_state": runner_state, "metrics": metric}
+        else:
+            tx = optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.adam(config["LR"], eps=1e-5),
+            )
+        train_state = TrainState.create(
+            apply_fn=network.apply,
+            params=network_params,
+            tx=tx,
+        )
+        rng, _rng = jax.random.split(rng)
+        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
+        obsv, env_state = env.reset(reset_rng, env_params)
+        rng, _rng = jax.random.split(rng)
+        return (train_state, env_state, obsv, _rng)
 
-    return train
+    def update(runner_state, num_steps):
+        runner_state, metric = jax.lax.scan(
+            _update_step, runner_state, None, num_steps
+        )
+        return runner_state, metric
+
+    return init, update
 
 def main(_):
     exp_name = FLAGS.job_name
@@ -353,28 +343,52 @@ def main(_):
         os.makedirs(save_folder)
     else:
         os.system(f"rm -rf {save_folder}/*")
-    logdir = os.path.join(save_folder, "logs")
-    writer = SummaryWriter(logdir)
 
-    env_name = "h1_reach_continual_two_hands"  # "h1_reach_continual" or "h1_reach_continual_two_hands"
+    env_name = FLAGS.env_name
     if env_name == 'h1_reach_continual':
         dimU = 19
         dimO = 55
+        dimO_actor = 55   # symmetric: no privileged critic obs
+        env_kwargs = {
+            'collisions': 'feet', 'act_control': 'pos', 'hands': 'both',
+            'reward_weights_dict': {'alive': 1.0, 'vel': 1.0,
+                                    'l1_weight': 1.0, 'l1_dist': 0.05,
+                                    'l2_weight': 2.0, 'l2_dist': 0.3},
+        }
     elif env_name == 'h1_reach_continual_two_hands':
         dimU = 19
         dimO = 61
+        dimO_actor = 61   # symmetric: no privileged critic obs
+        env_kwargs = {
+            'collisions': 'feet', 'act_control': 'pos', 'hands': 'both',
+            'reward_weights_dict': {'alive': 1.0, 'vel': 1.0,
+                                    'l1_weight': 1.0, 'l1_dist': 0.05,
+                                    'l2_weight': 2.0, 'l2_dist': 0.3},
+        }
+    elif env_name == 'h1_lowlevel_loco':
+        dimU = 19
+        dimO = 81         # critic obs: actor_obs(76) + local_linvel(3) + feet_contact(2)
+        dimO_actor = 76   # actor obs: gyro(3)+upvec(3)+cmd(3)+wb_cmd(10)+qpos(19)+qvel(19)+act(19)
+        env_kwargs = {}
+    elif env_name == 'h1_lowlevel_stand':
+        dimU = 19
+        dimO = 75         # critic obs: actor_obs(70) + local_linvel(3) + feet_contact(2)
+        dimO_actor = 70   # actor obs: gyro(3)+upvec(3)+wb_cmd(7)+qpos(19)+qvel(19)+act(19)
+        env_kwargs = {}
     else:
-        raise ValueError("Unknown environment")
+        raise ValueError(f"Unknown environment: {env_name}")
+
     config = {
         'DIMU': dimU,
         'DIMO': dimO,
+        'DIMO_ACTOR': dimO_actor,
         "SAVE_FOLDER": save_folder,
-        "LR": 3e-4, 
-        "NUM_ENVS": 32768, 
-        "NUM_STEPS": 16, 
+        "LR": 3e-4,
+        "NUM_ENVS": FLAGS.num_envs,
+        "NUM_STEPS": 16,
         "TOTAL_TIMESTEPS": 4e9,
-        "UPDATE_EPOCHS": 4, 
-        "NUM_MINIBATCHES": 32, 
+        "UPDATE_EPOCHS": 4,
+        "NUM_MINIBATCHES": 32,
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
         "CLIP_EPS": 0.2,
@@ -383,40 +397,41 @@ def main(_):
         "MAX_GRAD_NORM": 0.5,
         "ACTIVATION": "tanh",
         "ENV_NAME": env_name,
-        "ENV_KWARGS": {'collisions': 'feet',
-                       'act_control': 'pos',
-                       'hands': 'both',
-                       # l1 and l2 are curriculum rewards
-                       'reward_weights_dict': {'alive': 1.0,
-                                               'vel': 1.0,
-                                               'l1_weight': 1.0,
-                                               'l1_dist': 0.05,
-                                               'l2_weight': 2.0,
-                                               'l2_dist': 0.3
-                                               }
-                       },
+        "ENV_KWARGS": env_kwargs,
         "ANNEAL_LR": True,
         "NORMALIZE_ENV": True,
         "DEBUG": True,
-        "SAVE_FOLDER": save_folder,
-
     }
+    wandb.init(project="humanoid-bench", name=exp_name, config=config)
+
     rng = jax.random.PRNGKey(FLAGS.seed)
-    train_jit = jax.jit(make_train(config, writer))
-    out = train_jit(rng)
+    init_fn, update_fn = make_train(config)
+    init_jit   = jax.jit(init_fn)
+    update_jit = jax.jit(update_fn, static_argnums=(1,))
 
-    print("mean: ", out['runner_state'][1].env_state.mean.shape, flush=True)
-    print("var: ", out['runner_state'][1].env_state.var.shape, flush=True)
+    runner_state = init_jit(rng)
 
-    # Save model
-    torch_model = TorchModel(dimO, dimU)
+    # For loop is in Python so each scan compiles independently (1x memory, not split_scan_n x)
+    split_scan_n = int(config["TOTAL_TIMESTEPS"] // 5e8 + 1)
+    steps_per_split = config["NUM_UPDATES"] // split_scan_n
+    metric = None
+    for i in range(split_scan_n):
+        runner_state, metric = update_jit(runner_state, steps_per_split)
+        print(f"Split {i+1}/{split_scan_n} done", flush=True)
 
-    torch_model = flax_to_torch(out['runner_state'][0], torch_model)
+    train_state, env_state = runner_state[0], runner_state[1]
+
+    print("mean: ", env_state.env_state.mean.shape, flush=True)
+    print("var: ", env_state.env_state.var.shape, flush=True)
+
+    # Save model — torch policy uses actor obs only
+    torch_model = TorchModel(dimO_actor, dimU)
+    torch_model = flax_to_torch(train_state, torch_model)
     torch_policy = TorchPolicy(torch_model)
     torch_policy.save(os.path.join(save_folder, "torch_model.pt"))
     # Save mean and var
-    mean = out['runner_state'][1].env_state.mean
-    var = out['runner_state'][1].env_state.var
+    mean = env_state.env_state.mean
+    var = env_state.env_state.var
     np.save(os.path.join(save_folder, "mean.npy"), mean)
     np.save(os.path.join(save_folder, "var.npy"), var)
 

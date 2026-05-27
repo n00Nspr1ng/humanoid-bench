@@ -107,6 +107,26 @@ The training entry point is the existing `humanoid_bench/mjx/ppo_continuous_acti
 
 ---
 
+## Training
+
+### Lowlevel stand policy (whole-body, standing only)
+
+```bash
+cd humanoid_bench/mjx
+python ppo_continuous_action.py --job_name lowlevel_stand_v1 --env_name h1_lowlevel_stand
+```
+
+### Lowlevel loco policy (locomotion + whole-body)
+
+```bash
+cd humanoid_bench/mjx
+python ppo_continuous_action.py --job_name lowlevel_loco_v1 --env_name h1_lowlevel_loco
+```
+
+Checkpoints are saved to `./data/<job_name>/` every 100 update steps.
+
+---
+
 ## Installation
 
 ```bash

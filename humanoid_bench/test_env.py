@@ -1,5 +1,6 @@
 import argparse
 import pathlib
+import time
 
 import cv2
 import gymnasium as gym
@@ -46,6 +47,7 @@ if __name__ == "__main__":
     img = env.render()
     rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     cv2.imwrite("test_env_img.png", rgb_img)
+    env.close()
 
     # Test online rendering with interactive viewer
     print(f"Test onscreen mode...")
@@ -71,13 +73,17 @@ if __name__ == "__main__":
         action = env.action_space.sample()
         ob, rew, terminated, truncated, info = env.step(action)
         img = env.render()
+        time.sleep(0.1)
         ret += rew
 
         if args.render_mode == "rgb_array":
             cv2.imshow("test_env", img[:, :, ::-1])
             cv2.waitKey(1)
+        
+        # if ret == 1:
+        #     cv2.imwrite("test_env_img.png", img[:, :, ::-1])
 
         if terminated or truncated:
             ret = 0
-            env.reset()
+            ob, _ = env.reset()
     env.close()
