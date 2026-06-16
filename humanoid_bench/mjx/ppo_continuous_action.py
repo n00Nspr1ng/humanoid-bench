@@ -1,4 +1,5 @@
 import jax
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import flax.linen as nn
 import numpy as np
@@ -127,10 +128,11 @@ def make_train(config):
                 )
 
                 def filter_nan_state(state):
+                    if not jnp.issubdtype(state.dtype, jnp.floating):
+                        return state
                     return jnp.where(jnp.isnan(state), jnp.zeros_like(state), state)
 
                 obsv = jax.tree_map(filter_nan_state, obsv)
-                env_state = jax.tree_map(filter_nan_state, env_state)
 
                 transition = Transition(
                     done, action, value, reward, log_prob, last_obs, info
@@ -285,6 +287,13 @@ def make_train(config):
                             if len(total_successes) > 0:
                                 wandb.log({"train/total_successes": wandb.Histogram(np.array(total_successes))}, step=step)
 
+                        if config["ENV_NAME"].startswith("h1_lowlevel"):
+                            brax_state = env_state.env_state.env_state.env_state
+                            wandb.log({
+                                f"rewards/{k}": float(jnp.mean(v))
+                                for k, v in brax_state.metrics.items()
+                            }, step=step)
+
                         if step // (config["NUM_STEPS"] * config["NUM_ENVS"]) % 100 == 0:
                             print("Saving model")
                             save_folder = config["SAVE_FOLDER"]
@@ -301,7 +310,7 @@ def make_train(config):
                 jax.debug.callback(callback, metric, env_state, train_state)
 
             runner_state = (train_state, env_state, last_obs, rng)
-            return runner_state, metric
+            return runner_state, None
 
     def init(rng):
         rng, _rng = jax.random.split(rng)
@@ -329,10 +338,10 @@ def make_train(config):
         return (train_state, env_state, obsv, _rng)
 
     def update(runner_state, num_steps):
-        runner_state, metric = jax.lax.scan(
+        runner_state, _ = jax.lax.scan(
             _update_step, runner_state, None, num_steps
         )
-        return runner_state, metric
+        return runner_state
 
     return init, update
 
@@ -414,9 +423,8 @@ def main(_):
     # For loop is in Python so each scan compiles independently (1x memory, not split_scan_n x)
     split_scan_n = int(config["TOTAL_TIMESTEPS"] // 5e8 + 1)
     steps_per_split = config["NUM_UPDATES"] // split_scan_n
-    metric = None
     for i in range(split_scan_n):
-        runner_state, metric = update_jit(runner_state, steps_per_split)
+        runner_state = update_jit(runner_state, steps_per_split)
         print(f"Split {i+1}/{split_scan_n} done", flush=True)
 
     train_state, env_state = runner_state[0], runner_state[1]

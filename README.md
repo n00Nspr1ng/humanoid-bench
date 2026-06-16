@@ -127,6 +127,32 @@ Checkpoints are saved to `./data/<job_name>/` every 100 update steps.
 
 ---
 
+## Evaluation
+
+```bash
+cd humanoid_bench/mjx
+
+# Interactive viewer — opens a MuJoCo window and runs the policy in real time, not specifying step will evaluate the final checkpoint
+python eval_lowlevel.py --folder data/lowlevel_stand_v1 --step 57344
+
+# Record 5 rollouts to video (saved as data/lowlevel_stand_v1/evaluation.mp4)
+python eval_lowlevel.py --folder data/lowlevel_stand_v1 --step 57344 --render
+
+# Sweep through all existing checkpoints and output each checkpoint's episode length
+python sweep_eval.py --folder data/lowlevel_stand_v1 --every 1
+
+# Evaluate in gpu MuJoCo
+python eval_mjx.py --folder data/lowlevel_stand_v2 --step 1998848000
+```
+
+Checkpoints are written during training as `torch_model_<step>.pt` / `mean_<step>.npy` / `var_<step>.npy`, so evaluation can run alongside training.
+
+> **Note:** If the robot falls immediately in CPU eval despite training succeeding, try an
+> earlier checkpoint. Very long training runs may cause the policy to develop large raw action
+> outputs that corrupt the `last_act` observation in deployment.
+
+---
+
 ## Installation
 
 ```bash

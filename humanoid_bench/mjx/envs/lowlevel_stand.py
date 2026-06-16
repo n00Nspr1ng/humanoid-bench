@@ -22,6 +22,25 @@ _MAX_CONTACT_FORCE = 500.0
 
 _GRAVITY = jp.array([0.0, 0.0, -1.0])
 
+# Domain randomization ranges (matching mujoco_playground G1 joystick)
+_DR_FLOOR_FRICTION_LOW  = 0.4
+_DR_FLOOR_FRICTION_HIGH = 1.0
+_DR_ARMATURE_LOW        = 1.0
+_DR_ARMATURE_HIGH       = 1.05
+_DR_MASS_SCALE_LOW      = 0.9
+_DR_MASS_SCALE_HIGH     = 1.1
+_DR_TORSO_MASS_OFFSET   = 1.0   # ± kg
+_DR_QPOS_JITTER         = 0.05  # rad
+_DR_DAMPING_LOW         = 0.5   # scale × base (1.0 Nm·s/rad for H1 actuated joints)
+_DR_DAMPING_HIGH        = 2.0
+
+# Observation noise scales (uniform ±)
+_OBS_NOISE_GYRO   = 0.2
+_OBS_NOISE_UPVEC  = 0.05
+_OBS_NOISE_QPOS   = 0.01
+_OBS_NOISE_QVEL   = 1.5
+_OBS_NOISE_LINVEL = 0.1
+
 _LIN_VEL_X   = (-1.0, 1.5)
 _LIN_VEL_Y   = (-0.8, 0.8)
 _ANG_VEL_YAW = (-0.7, 0.7)
@@ -69,14 +88,21 @@ REWARD_SCALES = {
     "dof_acc_l2":            -2.5e-7,
     "torques":                0.0,
     # Termination — Isaac Lab weight
-    "termination_penalty":   -200.0,
+    "termination_penalty":   -2000.0,
+    # Alive bonus
+    "alive":                  0.1,
 }
 
 
 class H1LowLevelStand(MjxEnv):
     """H1 lowlevel locomotion + whole-body command tracking."""
 
-    def __init__(self, **kwargs):
+    def __init__(self,
+                 physics_randomization: bool = True,
+                 obs_noise: bool = True,
+                 **kwargs):
+        self._physics_randomization = physics_randomization
+        self._obs_noise = obs_noise
         mj_model = mujoco.MjModel.from_xml_path(_XML_PATH)
         mj_model.opt.timestep = _SIM_DT
         kwargs["n_frames"] = kwargs.get("n_frames", _N_FRAMES)
@@ -163,7 +189,14 @@ class H1LowLevelStand(MjxEnv):
         self.actor_obs_dim = 3 + 3 + 7 + 19 + 19 + 19  # 70
         # critic obs appends local_linvel(3) + feet_contact(2)
         self.state_dim  = self.actor_obs_dim + 3 + 2    # 75
-        self.action_dim = self.sys.nu                        # 19
+        self.action_dim = self.sys.nu                    # 19
+
+        # Base physics values for domain randomization (stored as JAX arrays)
+        self._base_geom_friction = jp.array(mj_model.geom_friction)  # (ngeom, 3)
+        self._base_armature      = jp.array(mj_model.dof_armature)   # (nv,)
+        self._base_body_mass     = jp.array(mj_model.body_mass)       # (nbody,)
+        self._base_dof_damping   = jp.array(mj_model.dof_damping)    # (nv,) — [6:]=1.0
+        self._floor_geom_id      = 0  # floor is always geom 0 in scene_mjx_h1_lowlevel.xml
 
     # ------------------------------------------------------------------ #
     #  Command sampling                                                    #
@@ -192,39 +225,81 @@ class H1LowLevelStand(MjxEnv):
     # ------------------------------------------------------------------ #
 
     def reset(self, rng: jax.Array) -> State:
-        rng, cmd_rng, wb_rng = jax.random.split(rng, 3)
+        rng, cmd_rng, wb_rng, dr_rng = jax.random.split(rng, 4)
 
-        data     = self.pipeline_init(self._init_q, jp.zeros(self.sys.nv))
+        # Domain randomization — sample per-episode physics params and qpos jitter
+        if self._physics_randomization:
+            rng_fr, rng_arm, rng_mass, rng_torso, rng_qpos, rng_damp = jax.random.split(dr_rng, 6)
+            floor_friction = jax.random.uniform(
+                rng_fr, shape=(), minval=_DR_FLOOR_FRICTION_LOW, maxval=_DR_FLOOR_FRICTION_HIGH)
+            dr_geom_friction = self._base_geom_friction.at[self._floor_geom_id, 0].set(floor_friction)
+            armature_scale = jax.random.uniform(
+                rng_arm, shape=(self.sys.nu,), minval=_DR_ARMATURE_LOW, maxval=_DR_ARMATURE_HIGH)
+            dr_armature = self._base_armature.at[6:].set(self._base_armature[6:] * armature_scale)
+            mass_scale = jax.random.uniform(
+                rng_mass, shape=(self.sys.nbody,), minval=_DR_MASS_SCALE_LOW, maxval=_DR_MASS_SCALE_HIGH)
+            torso_offset = jax.random.uniform(
+                rng_torso, shape=(), minval=-_DR_TORSO_MASS_OFFSET, maxval=_DR_TORSO_MASS_OFFSET)
+            dr_body_mass = (self._base_body_mass * mass_scale).at[self._torso_body_id].add(torso_offset)
+            damping_scale = jax.random.uniform(
+                rng_damp, shape=(self.sys.nu,), minval=_DR_DAMPING_LOW, maxval=_DR_DAMPING_HIGH)
+            dr_dof_damping = self._base_dof_damping.at[6:].set(self._base_dof_damping[6:] * damping_scale)
+            qpos_jitter = jax.random.uniform(
+                rng_qpos, shape=(self.sys.nu,), minval=-_DR_QPOS_JITTER, maxval=_DR_QPOS_JITTER)
+            init_q = self._init_q.at[7:].add(qpos_jitter)
+        else:
+            dr_geom_friction = self._base_geom_friction
+            dr_armature      = self._base_armature
+            dr_body_mass     = self._base_body_mass
+            dr_dof_damping   = self._base_dof_damping
+            init_q           = self._init_q
+
+        data     = self.pipeline_init(init_q, jp.zeros(self.sys.nv))
         loco_cmd = self.sample_command(cmd_rng)
         wb_cmd   = self.sample_wb_cmd(wb_rng)
 
         info = {
-            "rng":              rng,
-            "step":             jp.zeros((), dtype=jp.int32),
-            "command":          loco_cmd,
-            "wb_cmd":           wb_cmd,
-            "last_act":         jp.zeros(self.sys.nu),
-            "feet_air_time":    jp.zeros(2),
-            "last_contact":     jp.zeros(2, dtype=bool),
-            "last_left_ee_pos": data.data.site_xpos[self._left_hand_site_id],
-            "last_right_ee_pos":data.data.site_xpos[self._right_hand_site_id],
+            "rng":               rng,
+            "step":              jp.zeros((), dtype=jp.int32),
+            "command":           loco_cmd,
+            "wb_cmd":            wb_cmd,
+            "last_act":          jp.zeros(self.sys.nu),
+            "feet_air_time":     jp.zeros(2),
+            "last_contact":      jp.zeros(2, dtype=bool),
+            "last_left_ee_pos":  data.data.site_xpos[self._left_hand_site_id],
+            "last_right_ee_pos": data.data.site_xpos[self._right_hand_site_id],
+            "dr_geom_friction":  dr_geom_friction,
+            "dr_armature":       dr_armature,
+            "dr_body_mass":      dr_body_mass,
+            "dr_dof_damping":    dr_dof_damping,
         }
-        metrics = {k: jp.zeros(()) for k in REWARD_SCALES}
+        metrics      = {k: jp.zeros(()) for k in REWARD_SCALES}
 
-        obs         = self._get_obs(data.data, info)
+        obs          = self._get_obs(data.data, info)
         reward, done = jp.zeros(2)
         return State(data, obs, reward, done, metrics, info)
 
     def step(self, state: State, action: jax.Array) -> State:
-        rng, cmd_rng, wb_rng = jax.random.split(state.info["rng"], 3)
+        rng, cmd_rng, wb_rng, obs_rng = jax.random.split(state.info["rng"], 4)
 
         motor_targets = jp.clip(
             self._default_pose + action * self._action_scale,
             self._lowers, self._uppers,
         )
         xfrc_applied = jp.zeros((self.sys.nbody, 6))
+
+        if self._physics_randomization:
+            sys = self.sys.tree_replace({
+                "geom_friction": state.info["dr_geom_friction"],
+                "dof_armature":  state.info["dr_armature"],
+                "body_mass":     state.info["dr_body_mass"],
+                "dof_damping":   state.info["dr_dof_damping"],
+            })
+        else:
+            sys = self.sys
+
         data = perturbed_pipeline_step(
-            self.sys, state.pipeline_state, motor_targets, xfrc_applied, self._n_frames
+            sys, state.pipeline_state, motor_targets, xfrc_applied, self._n_frames
         )
 
         contact = self._get_foot_contact(data.data)
@@ -232,7 +307,7 @@ class H1LowLevelStand(MjxEnv):
         first_contact = (state.info["feet_air_time"] > 0.0) * contact_filt
         feet_air_time = (state.info["feet_air_time"] + self.dt) * ~contact
 
-        obs = self._get_obs(data.data, state.info)
+        obs = self._get_obs(data.data, state.info, obs_rng=obs_rng)
 
         # Termination conditions
         upvector = data.data.xmat[self._torso_body_id, :, 2]
@@ -253,26 +328,32 @@ class H1LowLevelStand(MjxEnv):
         rewards = {k: v * REWARD_SCALES[k] for k, v in rewards.items()}
         reward  = jp.clip(sum(rewards.values()) * self.dt, -10000.0, 10000.0)
 
+        # Effective action: inverse of the motor_target computation, bounded by joint limits.
+        # Storing the raw network output causes the policy mean to grow without bound
+        # (the gradient keeps pushing toward saturation while motor_targets are clipped),
+        # which corrupts the last_act obs term and breaks CPU deployment after ~50M steps.
+        effective_act = (motor_targets - self._default_pose) / self._action_scale
+
         # Update info in-place
         state.info["rng"]               = rng
-        state.info["last_act"]          = action
+        state.info["last_act"]          = effective_act
         state.info["feet_air_time"]     = feet_air_time
         state.info["last_contact"]      = contact
         state.info["last_left_ee_pos"]  = data.data.site_xpos[self._left_hand_site_id]
         state.info["last_right_ee_pos"] = data.data.site_xpos[self._right_hand_site_id]
         state.info["step"]              = state.info["step"] + 1
         state.info["command"] = jp.where(
-            state.info["step"] > 500,
+            state.info["step"] > 300,
             self.sample_command(cmd_rng),
             state.info["command"],
         )
         state.info["wb_cmd"] = jp.where(
-            state.info["step"] > 500,
+            state.info["step"] > 300,
             self.sample_wb_cmd(wb_rng),
             state.info["wb_cmd"],
         )
         state.info["step"] = jp.where(
-            done | (state.info["step"] > 500),
+            done | (state.info["step"] > 300),
             jp.zeros((), dtype=jp.int32),
             state.info["step"],
         )
@@ -280,7 +361,7 @@ class H1LowLevelStand(MjxEnv):
         for k, v in rewards.items():
             state.metrics[k] = v
 
-        done = done.astype(jp.float32)
+        done = done.astype(jp.float64)
         return state.replace(pipeline_state=data, obs=obs, reward=reward, done=done)
 
     # ------------------------------------------------------------------ #
@@ -307,20 +388,33 @@ class H1LowLevelStand(MjxEnv):
     #  Observation                                                         #
     # ------------------------------------------------------------------ #
 
-    def _get_obs(self, data, info: dict) -> jax.Array:
+    def _get_obs(self, data, info: dict, obs_rng=None) -> jax.Array:
         """Returns 75D critic obs = actor_obs(70) + local_linvel(3) + feet_contact(2)."""
         gyro, upvector, local_linvel = self._get_imu(data)
         feet_contact = self._get_foot_contact(data).astype(jp.float32)
         wb_cmd = info["wb_cmd"]
+
+        if self._obs_noise and obs_rng is not None:
+            rng_g, rng_u, rng_qp, rng_qv, rng_lv = jax.random.split(obs_rng, 5)
+            gyro         = gyro         + jax.random.uniform(rng_g,  (3,),            minval=-_OBS_NOISE_GYRO,   maxval=_OBS_NOISE_GYRO)
+            upvector     = upvector     + jax.random.uniform(rng_u,  (3,),            minval=-_OBS_NOISE_UPVEC,  maxval=_OBS_NOISE_UPVEC)
+            qpos_noise   = jax.random.uniform(rng_qp, (self.sys.nu,), minval=-_OBS_NOISE_QPOS,  maxval=_OBS_NOISE_QPOS)
+            qvel_noise   = jax.random.uniform(rng_qv, (self.sys.nu,), minval=-_OBS_NOISE_QVEL,  maxval=_OBS_NOISE_QVEL)
+            linvel_noise = jax.random.uniform(rng_lv, (3,),            minval=-_OBS_NOISE_LINVEL, maxval=_OBS_NOISE_LINVEL)
+        else:
+            qpos_noise   = jp.zeros(self.sys.nu)
+            qvel_noise   = jp.zeros(self.sys.nu)
+            linvel_noise = jp.zeros(3)
+
         actor_obs = jp.concatenate([
-            gyro,                                           #  3 – body-frame angular velocity
-            upvector,                                       #  3 – torso z-axis in world (gravity proxy)
-            jp.concatenate([wb_cmd[:6], wb_cmd[9:10]]),     #  7 – wb_cmd: [l_ee(3), r_ee(3), height]
-            data.qpos[7:] - self._default_pose,             # 19 – joint position deviation
-            data.qvel[6:],                                  # 19 – joint velocities
-            info["last_act"],                               # 19 – last action
+            gyro,                                                    #  3 – body-frame angular velocity
+            upvector,                                                #  3 – torso z-axis in world (gravity proxy)
+            jp.concatenate([wb_cmd[:6], wb_cmd[9:10]]),              #  7 – wb_cmd: [l_ee(3), r_ee(3), height]
+            data.qpos[7:] - self._default_pose + qpos_noise,        # 19 – joint position deviation
+            data.qvel[6:] + qvel_noise,                              # 19 – joint velocities
+            info["last_act"],                                        # 19 – last action
         ])  # 70D
-        return jp.concatenate([actor_obs, local_linvel, feet_contact])  # 75D
+        return jp.concatenate([actor_obs, local_linvel + linvel_noise, feet_contact])  # 75D
 
     # ------------------------------------------------------------------ #
     #  Reward computation                                                  #
@@ -364,7 +458,8 @@ class H1LowLevelStand(MjxEnv):
             "energy":                self._cost_energy(data.qvel[6:], data.qfrc_actuator),
             "dof_acc_l2":            self._cost_dof_acc_l2(data.qacc[6:]),
             "torques":               self._cost_torques(data.qfrc_actuator[6:]),
-            "termination_penalty":   done.astype(jp.float32),
+            "termination_penalty":   done.astype(jp.float64),
+            "alive":                 (1.0 - done.astype(jp.float64)),
         }
 
     # --- tracking (exp rewards) ---
