@@ -293,6 +293,15 @@ def make_train(config):
                                 f"rewards/{k}": float(jnp.mean(v))
                                 for k, v in brax_state.metrics.items()
                             }, step=step)
+                            _error_keys = [
+                                "height_error", "ee_left_error", "ee_right_error",
+                                "lin_vel_xy_error", "ang_vel_z_error",
+                            ]
+                            wandb.log({
+                                f"errors/{k}": float(jnp.mean(brax_state.info[k]))
+                                for k in _error_keys
+                                if k in brax_state.info
+                            }, step=step)
 
                         if step // (config["NUM_STEPS"] * config["NUM_ENVS"]) % 100 == 0:
                             print("Saving model")

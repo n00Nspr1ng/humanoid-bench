@@ -21,6 +21,7 @@ import tqdm
 from pathlib import Path
 
 from flax_to_torch import TorchModel, TorchPolicy
+import envs.lowlevel_cfg as _cfg
 
 def save_numpy_as_video(array: np.ndarray, filename: str, fps: int = 50) -> None:
     """Save (T, H, W, 3) uint8 array as mp4 using OpenCV."""
@@ -38,20 +39,30 @@ _XML_PATH = str(
     Path(__file__).parents[2]
     / "humanoid_bench/assets/mjx/scene_mjx_h1_lowlevel.xml"
 )
-_SIM_DT   = 0.004
-_N_FRAMES = 5          # ctrl_dt = 0.02 s
+_SIM_DT   = _cfg.SIM_DT
+_N_FRAMES = _cfg.N_FRAMES
 
-_ACTION_SCALE_LEGS       = 0.5
-_ACTION_SCALE_ARMS_PITCH = 1.0
-_ACTION_SCALE_ARMS       = 0.75
+_ACTION_SCALE_LEGS       = _cfg.ACTION_SCALE_LEGS
+_ACTION_SCALE_ARMS_PITCH = _cfg.ACTION_SCALE_ARMS_PITCH
+_ACTION_SCALE_ARMS       = _cfg.ACTION_SCALE_ARMS
 
-# wb_cmd sampling ranges (must match lowlevel_stand.py)
-_WB_LEFT_EE_LOW   = np.array([0.05,  0.0,  -0.19])
-_WB_LEFT_EE_HIGH  = np.array([0.55,  0.70,  0.20])
-_WB_RIGHT_EE_LOW  = np.array([0.05, -0.70, -0.19])
-_WB_RIGHT_EE_HIGH = np.array([0.55,  0.0,   0.20])
-_WB_HEIGHT_LOW    = 0.6
-_WB_HEIGHT_HIGH   = 1.0
+_TRACKING_SIGMA_VEL    = _cfg.TRACKING_SIGMA_VEL
+_TRACKING_SIGMA_HEIGHT = _cfg.TRACKING_SIGMA_HEIGHT
+_TRACKING_SIGMA_EE     = _cfg.TRACKING_SIGMA_EE
+_GRAVITY        = np.array([0.0, 0.0, -1.0])
+
+_REWARD_SCALES_BY_ENV = {
+    "h1_lowlevel_stand": _cfg.STAND_REWARD_SCALES,
+    "h1_lowlevel_loco":  _cfg.LOCO_REWARD_SCALES,
+}
+
+# wb_cmd sampling ranges — sourced from cfg
+_WB_LEFT_EE_LOW   = _cfg.WB_LEFT_EE_LOW
+_WB_LEFT_EE_HIGH  = _cfg.WB_LEFT_EE_HIGH
+_WB_RIGHT_EE_LOW  = _cfg.WB_RIGHT_EE_LOW
+_WB_RIGHT_EE_HIGH = _cfg.WB_RIGHT_EE_HIGH
+_WB_HEIGHT_LOW    = _cfg.WB_HEIGHT_LOW
+_WB_HEIGHT_HIGH   = _cfg.WB_HEIGHT_HIGH
 
 # Observation dims per policy type
 _OBS_DIMS = {
@@ -90,6 +101,29 @@ class LowlevelCPUEnv:
         self._lhand_site = self.model.site("left_hand").id
         self._rhand_site = self.model.site("right_hand").id
 
+        # Ankle body IDs for feet_slide reward
+        self._left_ankle_id  = self.model.body("left_ankle_link").id
+        self._right_ankle_id = self.model.body("right_ankle_link").id
+
+        # Joint index subsets for reward terms
+        self._hip_idx = np.array([self.model.joint(n).qposadr - 7
+                                   for n in ["left_hip_yaw", "left_hip_roll",
+                                             "right_hip_yaw", "right_hip_roll"]])
+        self._leg_idx = np.array([self.model.joint(n).qposadr - 7
+                                   for n in ["left_hip_pitch", "left_knee", "left_ankle",
+                                             "right_hip_pitch", "right_knee", "right_ankle"]])
+        self._arm_idx = np.array([self.model.joint(n).qposadr - 7
+                                   for n in ["left_shoulder_pitch", "left_shoulder_roll",
+                                             "left_shoulder_yaw", "left_elbow",
+                                             "right_shoulder_pitch", "right_shoulder_roll",
+                                             "right_shoulder_yaw", "right_elbow"]])
+        self._torso_jnt_idx = self.model.joint("torso").qposadr - 7
+
+        # Soft joint limits (10 % inset, matches training)
+        _jnt_margin = 0.1
+        self._soft_lowers = self._lowers + _jnt_margin * (self._uppers - self._lowers)
+        self._soft_uppers = self._uppers - _jnt_margin * (self._uppers - self._lowers)
+
         # Per-joint action scale (same logic as _post_init)
         arm_names   = ["left_shoulder_pitch",  "left_shoulder_roll",
                        "left_shoulder_yaw",    "left_elbow",
@@ -117,6 +151,10 @@ class LowlevelCPUEnv:
         self._init_last_act = np.zeros(self.model.nu)
         self._last_act = self._init_last_act.copy()
         self._step = 0
+
+        # Previous EE positions for jitter penalty (updated each step)
+        self._last_left_ee  = np.zeros(3)
+        self._last_right_ee = np.zeros(3)
 
     def _get_imu(self):
         R = self.data.xmat[self._torso_id].reshape(3, 3)
@@ -197,8 +235,11 @@ class LowlevelCPUEnv:
         # Store effective action (matches training fix in lowlevel_stand.py).
         self._last_act = (motor_targets - self._default_pose) / self._action_scale
 
+        self._last_left_ee  = self.data.site_xpos[self._lhand_site].copy()
+        self._last_right_ee = self.data.site_xpos[self._rhand_site].copy()
+
         self._step += 1
-        if self._step > 300 and rng is not None:
+        if self._step > 500 and rng is not None:
             self._wb_cmd = self._sample_wb_cmd(rng)
             self._step = 0
 
@@ -218,6 +259,107 @@ class LowlevelCPUEnv:
         )
         obs = self._get_obs()
         return obs, done
+
+    def compute_rewards(self, action: np.ndarray, prev_action: np.ndarray) -> dict:
+        """Compute all reward terms matching lowlevel_stand.py, for diagnostics."""
+        qpos = self.data.qpos[7:]
+        gyro, upvector, local_linvel = self._get_imu()
+        cmd    = self._loco_cmd
+        wb_cmd = self._wb_cmd
+
+        R_torso  = self.data.xmat[self._torso_id].reshape(3, 3)
+        R_pelvis = self.data.xmat[self._pelvis_id].reshape(3, 3)
+        torso_pos = self.data.xpos[self._torso_id]
+
+        left_ee_torso  = R_torso.T @ (self.data.site_xpos[self._lhand_site]  - torso_pos)
+        right_ee_torso = R_torso.T @ (self.data.site_xpos[self._rhand_site] - torso_pos)
+        l_ee_err = np.sum(np.square(left_ee_torso  - wb_cmd[:3]))
+        r_ee_err = np.sum(np.square(right_ee_torso - wb_cmd[3:6]))
+
+        feet = self._get_feet_contact().astype(float)
+        ankles = np.array([self._left_ankle_id, self._right_ankle_id])
+        feet_vel_xy = self.data.cvel[ankles, 3:5]
+        feet_slide  = float(np.sum(np.sum(np.square(feet_vel_xy), axis=-1) * feet))
+
+        proj_torso  = R_torso.T  @ _GRAVITY
+        proj_pelvis = R_pelvis.T @ _GRAVITY
+
+        dt = _N_FRAMES * _SIM_DT
+        left_vel  = (self.data.site_xpos[self._lhand_site]  - self._last_left_ee)  / dt
+        right_vel = (self.data.site_xpos[self._rhand_site] - self._last_right_ee) / dt
+
+        return {
+            "track_lin_vel_xy_exp":  float(np.exp(-np.sum(np.square(cmd[:2] - local_linvel[:2])) / _TRACKING_SIGMA_VEL)),
+            "track_ang_vel_z_exp":   float(np.exp(-np.square(cmd[2] - gyro[2]) / _TRACKING_SIGMA_VEL)),
+            "track_ee_pos_exp":      float(np.exp(-(l_ee_err + r_ee_err) / _TRACKING_SIGMA_EE)),
+            "track_height_exp":      float(np.exp(-np.square(self.data.qpos[2] - wb_cmd[9]) / _TRACKING_SIGMA_HEIGHT)),
+            "body_orientation_l2":   float(np.sum(np.square(proj_torso[:2]))),
+            "flat_orientation_l2":   float(np.sum(np.square(proj_pelvis[:2]))),
+            "lin_vel_z_l2":          float(np.square(self.data.cvel[self._torso_id, 5])),
+            "ang_vel_xy_l2":         float(np.sum(np.square(gyro[:2]))),
+            "feet_slide":            feet_slide,
+            "joint_deviation_hip":   float(np.sum(np.abs(qpos[self._hip_idx]      - self._default_pose[self._hip_idx]))),
+            "joint_deviation_torso": float(np.abs(qpos[self._torso_jnt_idx]       - self._default_pose[self._torso_jnt_idx])),
+            "joint_deviation_legs":  float(np.sum(np.abs(qpos[self._leg_idx]      - self._default_pose[self._leg_idx]))),
+            "joint_deviation_arms":  float(np.sum(np.abs(qpos[self._arm_idx]      - self._default_pose[self._arm_idx]))),
+            "dof_pos_limits":        float(np.sum(np.clip(self._soft_lowers - qpos, 0, None)
+                                                + np.clip(qpos - self._soft_uppers,  0, None))),
+            "penalize_ee_jitter":    float(np.linalg.norm(left_vel) + np.linalg.norm(right_vel)),
+            "action_rate_l2":        float(np.sum(np.square(action - prev_action))),
+            "energy":                float(np.sum(np.abs(self.data.qvel[6:]) * np.abs(self.data.qfrc_actuator[6:]))),
+            "dof_acc_l2":            float(np.sum(np.square(self.data.qacc[6:]))),
+            "alive":                 1.0,
+        }
+
+    def get_errors(self) -> dict:
+        """Return per-command tracking errors for diagnostics."""
+        gyro, _, local_linvel = self._get_imu()
+        wb_cmd    = self._wb_cmd
+        R_torso   = self.data.xmat[self._torso_id].reshape(3, 3)
+        torso_pos = self.data.xpos[self._torso_id]
+        left_ee   = R_torso.T @ (self.data.site_xpos[self._lhand_site]  - torso_pos)
+        right_ee  = R_torso.T @ (self.data.site_xpos[self._rhand_site] - torso_pos)
+        return {
+            "height":     (wb_cmd[9],          self.data.qpos[2],    self.data.qpos[2] - wb_cmd[9]),
+            "left_ee":    (wb_cmd[:3],          left_ee,              np.linalg.norm(left_ee  - wb_cmd[:3])),
+            "right_ee":   (wb_cmd[3:6],         right_ee,             np.linalg.norm(right_ee - wb_cmd[3:6])),
+            "lin_vel_xy": (self._loco_cmd[:2],  local_linvel[:2],     np.linalg.norm(local_linvel[:2] - self._loco_cmd[:2])),
+            "ang_vel_z":  (self._loco_cmd[2],   gyro[2],              gyro[2] - self._loco_cmd[2]),
+        }
+
+
+def print_diagnostics(env: "LowlevelCPUEnv", action: np.ndarray,
+                      prev_action: np.ndarray, step: int) -> None:
+    """Print commands, tracking errors, and weighted reward breakdown."""
+    rewards = env.compute_rewards(action, prev_action)
+    errors  = env.get_errors()
+    scales  = _REWARD_SCALES_BY_ENV[env.env_name]
+
+    print(f"\n{'─'*60}  step {step}")
+
+    print("COMMANDS & ERRORS")
+    h_cmd, h_cur, h_err = errors["height"]
+    print(f"  height      cmd={h_cmd:.3f}  cur={h_cur:.3f}  err={h_err:+.3f}")
+    l_cmd, l_cur, l_err = errors["left_ee"]
+    print(f"  left_ee     cmd=[{l_cmd[0]:.2f},{l_cmd[1]:.2f},{l_cmd[2]:.2f}]"
+          f"  cur=[{l_cur[0]:.2f},{l_cur[1]:.2f},{l_cur[2]:.2f}]  |err|={l_err:.3f}")
+    r_cmd, r_cur, r_err = errors["right_ee"]
+    print(f"  right_ee    cmd=[{r_cmd[0]:.2f},{r_cmd[1]:.2f},{r_cmd[2]:.2f}]"
+          f"  cur=[{r_cur[0]:.2f},{r_cur[1]:.2f},{r_cur[2]:.2f}]  |err|={r_err:.3f}")
+    v_cmd, v_cur, v_err = errors["lin_vel_xy"]
+    print(f"  lin_vel_xy  cmd=[{v_cmd[0]:.2f},{v_cmd[1]:.2f}]"
+          f"  cur=[{v_cur[0]:.2f},{v_cur[1]:.2f}]  |err|={v_err:.3f}")
+    w_cmd, w_cur, w_err = errors["ang_vel_z"]
+    print(f"  ang_vel_z   cmd={w_cmd:.3f}  cur={w_cur:.3f}  err={w_err:+.3f}")
+
+    print("REWARDS  (raw → weighted)")
+    total = 0.0
+    for name, raw in rewards.items():
+        scale = scales.get(name, 0.0)
+        weighted = raw * scale
+        total += weighted
+        print(f"  {name:<26s}  raw={raw:>10.4f}  ×{scale:>8.4f}  = {weighted:>10.4f}")
+    print(f"  {'TOTAL':<26s}  {'':>10}  {'':>9}    {total:>10.4f}")
 
 
 # ------------------------------------------------------------------ #
@@ -254,7 +396,7 @@ def infer(model, obs_full: np.ndarray, mean: np.ndarray, var: np.ndarray,
     x = torch.from_numpy(obs_norm[:actor_dim]).float()
     with torch.no_grad():
         action = model(x).numpy()
-    return action
+    return np.clip(action, -1.0, 1.0)
 
 
 def run_rollouts(env: LowlevelCPUEnv, model, mean, var,
@@ -364,6 +506,27 @@ def _draw_ee_targets(v, env: LowlevelCPUEnv) -> None:
         _add(mujoco.mjtGeom.mjGEOM_SPHERE,
              np.array([ACTUAL_RAD, 0, 0]), actual_pos, identity, actual_rgba)
 
+    # Draw target height marker: flat disc at wb_cmd[9] tracking pelvis xy.
+    # track_height_exp reward uses data.qpos[2] (pelvis z) vs wb_cmd[9].
+    pelvis_xy = env.data.qpos[:2]
+    target_z  = env._wb_cmd[9]
+    _add(mujoco.mjtGeom.mjGEOM_CYLINDER,
+         np.array([0.12, 0.005, 0.0]),
+         np.array([pelvis_xy[0], pelvis_xy[1], target_z]),
+         identity,
+         np.array([1.0, 1.0, 0.0, 0.5]))   # yellow, semi-transparent
+
+    # Vertical error line from current pelvis z to target z
+    current_z = env.data.qpos[2]
+    half_err  = abs(target_z - current_z) / 2.0
+    if half_err > 1e-4:
+        mid_z = (current_z + target_z) / 2.0
+        _add(mujoco.mjtGeom.mjGEOM_CAPSULE,
+             np.array([0.005, half_err, 0.0]),
+             np.array([pelvis_xy[0], pelvis_xy[1], mid_z]),
+             identity,
+             np.array([1.0, 0.6, 0.0, 0.8]))  # orange
+
     v.user_scn.ngeom = n
 
 
@@ -385,18 +548,24 @@ def run_interactive(env: LowlevelCPUEnv, model, mean, var, actor_dim: int,
     obs = env.reset(rng, last_act_init=last_act_init)
     with mujoco.viewer.launch_passive(env.model, env.data) as v:
         print("Passive viewer open — close the window to exit.")
+        print("  Yellow disc      = target pelvis height (track_height_exp)")
         print("  Red sphere/axes  = left  EE command target")
         print("  Blue sphere/axes = right EE command target")
         print("  Faint spheres    = actual EE positions")
         step = 0
+        prev_action = np.zeros(env.model.nu)
         while v.is_running():
             action = infer(model, obs, mean, var, actor_dim)
             obs, done = env.step(action, rng)
             _draw_ee_targets(v, env)
             v.sync()
+            if step % 50 == 0:
+                print_diagnostics(env, action, prev_action, step)
+            prev_action = action
             step += 1
             if done or step > 2000:
                 obs = env.reset(rng, last_act_init=last_act_init)
+                prev_action = np.zeros(env.model.nu)
                 step = 0
 
 

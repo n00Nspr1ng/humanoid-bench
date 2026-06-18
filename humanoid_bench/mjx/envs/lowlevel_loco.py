@@ -10,58 +10,23 @@ from brax.envs.base import MjxEnv, State
 from humanoid_bench.mjx.envs.utils import perturbed_pipeline_step
 
 from pathlib import Path
+import humanoid_bench.mjx.envs.lowlevel_cfg as _cfg
+
 _XML_PATH = str(Path(__file__).parents[3] / "humanoid_bench/assets/mjx/scene_mjx_h1_lowlevel.xml")
-_SIM_DT = 0.004
-_N_FRAMES = 5        # ctrl_dt = 0.02
-
-_ACTION_SCALE_LEGS        = 0.5
-_ACTION_SCALE_ARMS_PITCH  = 1.0
-_ACTION_SCALE_ARMS        = 0.75   # roll, yaw, elbow
-_TRACKING_SIGMA = 0.25
-_MAX_CONTACT_FORCE = 500.0
-_DEFAULT_HEIGHT = 0.98
-
-_LIN_VEL_X   = (-1.0, 1.5)
-_LIN_VEL_Y   = (-0.8, 0.8)
-_ANG_VEL_YAW = (-0.7, 0.7)
-
-# Reward scales (positive = bonus, negative = penalty)
-# Exp-tracking weights match Isaac Lab G1RewardCfg exactly.
-# Newly-added terms (not in Isaac Lab) use mujoco_playground G1 weights.
-REWARD_SCALES = {
-    # Exp tracking rewards — Isaac Lab weights
-    "track_lin_vel_xy_exp":   1.5,
-    "track_ang_vel_z_exp":    2.0,
-    "track_ee_pos_exp":       3.0,
-    "track_height_exp":       1.5,
-    "track_body_roll_exp":    1.75,
-    # Orientation costs — Isaac Lab weights
-    "body_ori_l1":           -0.2,
-    "flat_ori_l2":           -0.1,
-    # Base motion costs — Isaac Lab weights
-    "lin_vel_z_l2":          -0.1,
-    "ang_vel_xy_l2":         -0.05,
-    # Feet — Isaac Lab weights
-    "feet_air_time":          0.15,
-    "feet_slide":            -0.25,
-    "feet_force":            -3e-3,
-    # Pose — Isaac Lab for existing; mujoco_playground for new
-    "stand_still":            -1.0,
-    "joint_deviation_hip":    -0.15,
-    "joint_deviation_torso":  -0.2,    # H1 torso yaw ≡ G1 waist_yaw
-    "joint_deviation_legs":   -0.02,
-    "joint_deviation_arms":   -0.01,
-    "dof_pos_limits":         -2.0,
-    # EE regularisation
-    "penalize_ee_jitter":     -1e-4,   # L2 norm of finite-differenced EE linear velocity
-    # Energy / regularisation — Isaac Lab weights
-    "action_rate_l2":        -0.01,
-    "energy":                -1e-3,
-    "dof_acc_l2":            -2.5e-7,
-    "torques":                0.0,
-    # Termination — Isaac Lab weight
-    "termination_penalty":   -200.0,
-}
+_SIM_DT              = _cfg.SIM_DT
+_N_FRAMES            = _cfg.N_FRAMES
+_ACTION_SCALE_LEGS       = _cfg.ACTION_SCALE_LEGS
+_ACTION_SCALE_ARMS_PITCH = _cfg.ACTION_SCALE_ARMS_PITCH
+_ACTION_SCALE_ARMS       = _cfg.ACTION_SCALE_ARMS
+_TRACKING_SIGMA_VEL      = _cfg.TRACKING_SIGMA_VEL
+_TRACKING_SIGMA_HEIGHT   = _cfg.TRACKING_SIGMA_HEIGHT
+_TRACKING_SIGMA_EE       = _cfg.TRACKING_SIGMA_EE
+_MAX_CONTACT_FORCE       = _cfg.MAX_CONTACT_FORCE
+_DEFAULT_HEIGHT          = 0.98
+_LIN_VEL_X               = _cfg.LIN_VEL_X
+_LIN_VEL_Y               = _cfg.LIN_VEL_Y
+_ANG_VEL_YAW             = _cfg.ANG_VEL_YAW
+REWARD_SCALES            = _cfg.LOCO_REWARD_SCALES
 
 
 class H1LowLevelLoco(MjxEnv):
@@ -392,18 +357,18 @@ class H1LowLevelLoco(MjxEnv):
 
     def _reward_track_lin_vel_xy_exp(self, cmd, local_linvel) -> jax.Array:
         err = jp.sum(jp.square(cmd[:2] - local_linvel[:2]))
-        return jp.exp(-err / _TRACKING_SIGMA)
+        return jp.exp(-err / _TRACKING_SIGMA_VEL)
 
     def _reward_track_ang_vel_z_exp(self, cmd, gyro) -> jax.Array:
         err = jp.square(cmd[2] - gyro[2])
-        return jp.exp(-err / _TRACKING_SIGMA)
+        return jp.exp(-err / _TRACKING_SIGMA_VEL)
 
     def _reward_track_height_exp(self, height, target) -> jax.Array:
-        return jp.exp(-jp.square(height - target) / _TRACKING_SIGMA)
+        return jp.exp(-jp.square(height - target) / _TRACKING_SIGMA_HEIGHT)
 
     def _reward_track_body_roll_exp(self, upvector, target_roll) -> jax.Array:
         err = jp.square(upvector[1] - jp.sin(target_roll))
-        return jp.exp(-err / _TRACKING_SIGMA)
+        return jp.exp(-err / _TRACKING_SIGMA_EE)
 
     def _reward_track_ee_pos_exp(self, data, base_pos, wb_cmd) -> jax.Array:
         base_xy = jp.array([base_pos[0], base_pos[1], 0.0])
@@ -413,7 +378,7 @@ class H1LowLevelLoco(MjxEnv):
         r_err = jp.sum(jp.square(
             data.site_xpos[self._right_hand_site_id] - base_xy - wb_cmd[3:6]
         ))
-        return jp.exp(-(l_err + r_err) / _TRACKING_SIGMA)
+        return jp.exp(-(l_err + r_err) / _TRACKING_SIGMA_EE)
 
     # --- orientation costs ---
 
